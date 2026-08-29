@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.log
+
+# Environment (never commit secrets)
+.env
+
+# Data / caches
+data/
+__pycache__
+
+# OS
+.DS_Store
+
+# Build
+dist/
+build/

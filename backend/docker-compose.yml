@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: vin-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vinuser
+      POSTGRES_PASSWORD: vinpassword
+      POSTGRES_DB: vin_report
+    ports:
+      - "5432:5432"
+    volumes:
+      - vinreport_pgdata:/var/lib/postgresql/data
+
+volumes:
+  vinreport_pgdata:

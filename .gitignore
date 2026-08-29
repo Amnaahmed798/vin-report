@@ -1,0 +1,35 @@
+# Only track the frontend and backend folders
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.log
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Environment / secrets
+.env
+.env.local
+.env*.local
+
+# Draft files not needed for hosting
+*.pdf
+*.mht
+carfax_raw_text.txt
+header_preview.html
+
+# IMPORTANT: myissues.md contains API keys — exclude it anywhere
+myissues.md
+**/myissues.md
+
+# Roadmap (safe to keep, but optional)
+# VIN-Report-Website-Roadmap.md
+
+# OS
+.DS_Store
