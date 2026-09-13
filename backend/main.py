@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
@@ -1356,8 +1357,8 @@ async def pdf_capture(request: Request, vin: str, order_id: str) -> Response:
 
 @app.get("/api/quickbooks/auth")
 @limiter.limit("5/minute")
-async def qb_auth(request: Request) -> dict[str, str]:
-    """Return QuickBooks OAuth authorization URL for one-time setup."""
+async def qb_auth(request: Request) -> RedirectResponse:
+    """Start QuickBooks OAuth — bounce the browser straight to the Intuit authorize page."""
     if not QB_CLIENT_ID:
         raise HTTPException(status_code=503, detail="QuickBooks Client ID not configured.")
     global QB_AUTH_STATE
@@ -1370,7 +1371,7 @@ async def qb_auth(request: Request) -> dict[str, str]:
         f"&redirect_uri={QB_REDIRECT_URI}"
         f"&state={QB_AUTH_STATE}"
     )
-    return {"authorization_url": auth_url, "state": QB_AUTH_STATE}
+    return RedirectResponse(auth_url, status_code=302)
 
 
 @app.get("/api/quickbooks/status")
