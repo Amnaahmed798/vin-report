@@ -129,14 +129,6 @@ export function getPdfPreviewUrl(vin: string): string {
   return `${API_BASE}/api/vin/${encodeURIComponent(vin)}/pdf/preview#toolbar=0&navpanes=0`;
 }
 
-export type PdfCheckout = {
-  order_id: string;
-  provider: "quickbooks" | "demo";
-  price_usd: number;
-};
-
-export type PdfCaptureResult = Blob;
-
 async function readDetail(res: Response): Promise<string> {
   let detail = `Request failed (${res.status})`;
   try {
@@ -158,25 +150,43 @@ export async function fetchVinReport(vin: string): Promise<VinReport> {
   return res.json();
 }
 
-export async function startPdfCheckout(vin: string, cardToken: string): Promise<PdfCheckout> {
-  const res = await fetch(
-    `${API_BASE}/api/vin/${encodeURIComponent(vin)}/pdf/checkout`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ card_token: cardToken }),
-    },
-  );
+export type VinDecode = {
+  vin: string;
+  vehicle: {
+    Make: string;
+    Model: string;
+    ModelYear: string;
+    Trim: string;
+    BodyClass: string;
+    DisplacementL: string;
+    EngineCylinders: string;
+    EngineHP: string;
+    FuelTypePrimary: string;
+    DriveType: string;
+    Doors: string;
+    TransmissionStyle: string;
+    PlantCity: string;
+    PlantState: string;
+    PlantCountry: string;
+    Series: string;
+    VehicleType: string;
+    ManufacturerName: string;
+  };
+};
+
+export async function fetchVinDecode(vin: string): Promise<VinDecode> {
+  const res = await fetch(`${API_BASE}/api/vin/${encodeURIComponent(vin)}/decode`, {
+    cache: "no-store",
+  });
   if (!res.ok) {
     throw new Error(await readDetail(res));
   }
   return res.json();
 }
 
-export async function capturePdf(vin: string, orderId: string): Promise<PdfCaptureResult> {
-  const params = new URLSearchParams({ order_id: orderId });
+export async function generateReport(vin: string, plan: string): Promise<Blob> {
   const res = await fetch(
-    `${API_BASE}/api/vin/${encodeURIComponent(vin)}/pdf/capture?${params.toString()}`,
+    `${API_BASE}/api/vin/${encodeURIComponent(vin)}/generate-report?plan=${plan}`,
     { method: "POST" },
   );
   if (!res.ok) {
@@ -200,6 +210,67 @@ export function validateVin(vin: string): string | null {
     return "VIN failed the check digit (checksum) validation.";
   }
   return null;
+}
+
+export type QuickBooksStatus = {
+  configured: boolean;
+  client_id?: string | null;
+  env: string;
+  realm_id?: string | null;
+};
+
+export async function fetchQuickBooksStatus(): Promise<QuickBooksStatus> {
+  const res = await fetch(`${API_BASE}/api/quickbooks/status`, { cache: "no-store" });
+  if (!res.ok) {
+    return { configured: false, env: "sandbox", client_id: null, realm_id: null };
+  }
+  return res.json();
+}
+
+export type PdfCheckoutResult = {
+  order_id: string;
+  provider: string;
+  price_usd: number;
+  plan: string;
+  reports: number;
+};
+
+export async function pdfCheckout(vin: string, cardToken: string, plan: string): Promise<PdfCheckoutResult> {
+  const res = await fetch(`${API_BASE}/api/vin/${encodeURIComponent(vin)}/pdf/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ card_token: cardToken, plan }),
+  });
+  if (!res.ok) {
+    throw new Error(await readDetail(res));
+  }
+  return res.json();
+}
+
+export async function capturePdf(vin: string, orderId: string): Promise<Blob> {
+  const res = await fetch(
+    `${API_BASE}/api/vin/${encodeURIComponent(vin)}/pdf/capture?order_id=${encodeURIComponent(orderId)}`,
+    { method: "POST" },
+  );
+  if (!res.ok) {
+    throw new Error(await readDetail(res));
+  }
+  return res.blob();
+}
+
+export function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export function getQuickBooksAuthUrl(): string {
+  return `${API_BASE}/api/quickbooks/auth`;
 }
 
 const VIN_TRANSLITERATION: Record<string, number> = {

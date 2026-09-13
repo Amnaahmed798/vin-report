@@ -1149,6 +1149,7 @@ def build_report_html(
     theft_records: list[dict[str, Any]] | None = None,
     title_history: dict[str, Any] | None = None,
     nmvtis_available: bool = True,
+    plan_id: str = "gold",
 ) -> str:
     v = report.get("vehicle") or {}
     make = v.get("Make", "")
@@ -1159,14 +1160,20 @@ def build_report_html(
     title = f"{year} {make} {model} {trim}".strip()
     vehicle_label = title or "this vehicle"
 
+    plan_id = (plan_id or "gold").lower()
+
+    # All plans (basic, gold, premium) include the full report.
+    # Plans differ only in the number of reports purchased, not the data depth.
+    include_nmvtis = True
+
     highlights = highlights if highlights is not None else SAMPLE_HIGHLIGHTS
-    accident_html = build_accident_section(accidents if accidents is not None else SAMPLE_ACCIDENTS)
-    service_html = build_service_section(services if services is not None else SAMPLE_SERVICES)
-    page2_additional = build_additional_history(owners_history_checks if owners_history_checks is not None else SAMPLE_OWNERS_CHECKS)
-    theft_html = build_theft_records(theft_records)
-    title_history = build_title_history(title_history)
-    ownership_history = build_ownership_history(owners_ownership if owners_ownership is not None else SAMPLE_OWNERS_OWNERSHIP)
-    detailed_history = build_detailed_history(detailed_history if detailed_history is not None else SAMPLE_DETAILED_HISTORY)
+    accident_html = build_accident_section(accidents if (accidents is not None and include_nmvtis) else None)
+    service_html = build_service_section(services if (services is not None and include_nmvtis) else None)
+    page2_additional = build_additional_history(owners_history_checks if (owners_history_checks is not None and include_nmvtis) else None)
+    theft_html = build_theft_records(theft_records if include_nmvtis else None)
+    title_history = build_title_history(title_history if include_nmvtis else None)
+    ownership_history = build_ownership_history(owners_ownership if (owners_ownership is not None and include_nmvtis) else None)
+    detailed_history = build_detailed_history(detailed_history if (detailed_history is not None and include_nmvtis) else None)
 
     header = f'''<div class="header-bar">
       <div class="header-accent"></div>

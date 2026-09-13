@@ -36,7 +36,7 @@ export default function Hero() {
 
     setError(null);
 
-    router.push(`/report/${trimmed}`);
+    router.push(`/plans/${trimmed}`);
   }
 
   return (
@@ -518,9 +518,10 @@ export default function Hero() {
                     px-1
                     text-base
                     font-semibold
-                    tracking-[0.08em]
+                    tracking-[0.04em]
                     text-slate-900
                     outline-none
+                    sm:tracking-[0.08em]
                     placeholder:font-sans
                     placeholder:tracking-normal
                     placeholder:text-slate-400
@@ -535,12 +536,12 @@ export default function Hero() {
                     group/btn
                     flex
                     h-[54px]
+                    w-[54px]
                     shrink-0
                     items-center
-                    gap-2
+                    justify-center
                     rounded-xl
                     bg-blue-600
-                    px-5
                     text-sm
                     font-bold
                     text-white
@@ -553,11 +554,14 @@ export default function Hero() {
                     hover:shadow-xl
                     hover:shadow-blue-600/25
                     active:translate-y-0
+                    sm:w-auto
                     sm:rounded-full
                     sm:px-7
                   "
                 >
-                  Check VIN
+                  <span className="hidden sm:inline">
+                    Check VIN
+                  </span>
 
                   <svg
                     xmlns="http://www.w3.org/2000/svg"

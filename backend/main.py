@@ -1,12 +1,12 @@
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 import re
 import secrets
 import time
-import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from io import BytesIO
@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
@@ -100,16 +100,48 @@ try:
 except ImportError:  # pragma: no cover
     PDF_PROTECTION_AVAILABLE = False
 
-QB_CLIENT_ID = os.getenv("QB_CLIENT_ID", "")
-QB_CLIENT_SECRET = os.getenv("QB_CLIENT_SECRET", "")
-QB_ACCESS_TOKEN = os.getenv("QB_ACCESS_TOKEN", "")
-QB_REFRESH_TOKEN = os.getenv("QB_REFRESH_TOKEN", "")
-QB_REALM_ID = os.getenv("QB_REALM_ID", "")
+QBO_CREDENTIALS_FILE = Path(__file__).resolve().parent / "data" / "qbo_credentials.json"
+
+
+def _load_qb_credentials() -> dict[str, str]:
+    try:
+        data = json.loads(QBO_CREDENTIALS_FILE.read_text(encoding="utf-8"))
+        return {k: str(v) for k, v in data.items() if isinstance(v, str) and v}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Could not read %s: %s", QBO_CREDENTIALS_FILE, exc)
+        return {}
+
+
+def _save_qb_credentials(**updates: str | None) -> None:
+    data = _load_qb_credentials()
+    for key, value in updates.items():
+        if value:
+            data[key] = value
+        else:
+            data.pop(key, None)
+    try:
+        QBO_CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        QBO_CREDENTIALS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.chmod(QBO_CREDENTIALS_FILE, 0o600)
+    except Exception as exc:
+        logger.warning("Could not persist QuickBooks credentials: %s", exc)
+
+
+_qb_creds = _load_qb_credentials()
+QB_CLIENT_ID = os.getenv("QB_CLIENT_ID", "") or _qb_creds.get("client_id", "")
+QB_CLIENT_SECRET = os.getenv("QB_CLIENT_SECRET", "") or _qb_creds.get("client_secret", "")
+QB_ACCESS_TOKEN = os.getenv("QB_ACCESS_TOKEN", "") or _qb_creds.get("access_token", "")
+QB_REFRESH_TOKEN = os.getenv("QB_REFRESH_TOKEN", "") or _qb_creds.get("refresh_token", "")
+QB_REALM_ID = os.getenv("QB_REALM_ID", "") or _qb_creds.get("realm_id", "")
 QB_ENV = os.getenv("QB_ENV", "sandbox").lower()
 QB_API = "https://quickbooks.api.intuit.com" if QB_ENV == "production" else "https://sandbox.quickbooks.api.intuit.com"
 QB_REDIRECT_URI = os.getenv("QB_REDIRECT_URI", "http://localhost:8000/api/quickbooks/callback")
-QB_ENABLED = bool(QB_CLIENT_ID and QB_CLIENT_SECRET and QB_REALM_ID)
+QB_AUTH_STATE: str = ""
 PDF_PRICE_USD = float(os.getenv("PDF_PRICE_USD", "55.00"))
+PLAN_PRICES = {"basic": 45.00, "gold": 65.00, "premium": 85.00}
+PLAN_REPORTS = {"basic": 1, "gold": 2, "premium": 3}
 
 GLOBALVIN_API_KEY = os.getenv("GLOBALVIN_API_KEY", "")
 GLOBALVIN_BASE_URL = os.getenv("GLOBALVIN_BASE_URL", "https://globalvin.co/backend")
@@ -566,6 +598,38 @@ async def get_vin_report(request: Request, vin: str) -> VinReport:
     return await build_report(vin)
 
 
+@app.get("/api/vin/{vin}/decode")
+@limiter.limit("30/minute")
+async def decode_vin(request: Request, vin: str) -> dict[str, Any]:
+    clean = validate_vin(vin)
+    vpic = await fetch_vpic(clean)
+    if not vpic:
+        raise HTTPException(status_code=404, detail="Vehicle not found for this VIN")
+    return {
+        "vin": clean,
+        "vehicle": {
+            "Make": vpic.get("Make", ""),
+            "Model": vpic.get("Model", ""),
+            "ModelYear": vpic.get("ModelYear", ""),
+            "Trim": vpic.get("Trim", ""),
+            "BodyClass": vpic.get("BodyClass", ""),
+            "DisplacementL": vpic.get("DisplacementL", ""),
+            "EngineCylinders": vpic.get("EngineCylinders", ""),
+            "EngineHP": vpic.get("EngineHP", ""),
+            "FuelTypePrimary": vpic.get("FuelTypePrimary", ""),
+            "DriveType": vpic.get("DriveType", ""),
+            "Doors": vpic.get("Doors", ""),
+            "TransmissionStyle": vpic.get("TransmissionStyle", ""),
+            "PlantCity": vpic.get("PlantCity", ""),
+            "PlantState": vpic.get("PlantState", ""),
+            "PlantCountry": vpic.get("PlantCountry", ""),
+            "Series": vpic.get("Series", ""),
+            "VehicleType": vpic.get("VehicleType", ""),
+            "ManufacturerName": vpic.get("ManufacturerName", ""),
+        },
+    }
+
+
 @app.get("/api/vin/{vin}/pdf")
 @limiter.limit("10/minute")
 async def get_vin_pdf(request: Request, vin: str) -> Response:
@@ -588,6 +652,32 @@ async def get_vin_pdf_preview(request: Request, vin: str) -> Response:
         media_type="application/pdf",
         headers={
             "Content-Disposition": f'inline; filename="{vin}-preview.pdf"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/vin/{vin}/generate-report")
+@limiter.limit("20/minute")
+async def generate_plan_report(
+    request: Request, vin: str, plan: str = Query("gold")
+) -> Response:
+    clean = validate_vin(vin)
+    plan = plan.lower()
+    if plan not in ("basic", "gold", "premium"):
+        raise HTTPException(status_code=400, detail="Invalid plan. Must be basic, gold, or premium.")
+    try:
+        pdf = await render_pdf(clean, plan_id=plan)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to generate report: {e}")
+    report_no = make_report_number(clean)
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="CIP-{clean}-{plan}.pdf"',
+            "X-Report-Number": report_no,
+            "X-Plan": plan,
             "Cache-Control": "no-store",
         },
     )
@@ -1014,8 +1104,8 @@ def _build_real_detailed_history(report_data: dict[str, Any]) -> list[dict[str, 
     }]
 
 
-async def render_pdf(vin: str) -> bytes:
-    cache_key = vin
+async def render_pdf(vin: str, plan_id: str = "gold") -> bytes:
+    cache_key = f"{vin}:{plan_id}"
     cached = PDF_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -1048,6 +1138,7 @@ async def render_pdf(vin: str) -> bytes:
         theft_records=real_theft or None,
         title_history=real_title or None,
         nmvtis_available=nmvtis_available,
+        plan_id=plan_id,
     )
     try:
         from weasyprint import HTML
@@ -1127,6 +1218,7 @@ async def qb_refresh_access_token() -> dict[str, str]:
     QB_ACCESS_TOKEN = data["access_token"]
     if data.get("refresh_token"):
         QB_REFRESH_TOKEN = data["refresh_token"]
+    _save_qb_credentials(access_token=QB_ACCESS_TOKEN, refresh_token=QB_REFRESH_TOKEN)
     return {"access_token": QB_ACCESS_TOKEN, "refresh_token": QB_REFRESH_TOKEN}
 
 
@@ -1138,14 +1230,14 @@ async def qb_get_access_token() -> str:
     return QB_ACCESS_TOKEN
 
 
-async def qb_create_charge(vin: str, card_token: str) -> dict[str, Any]:
+async def qb_create_charge(vin: str, card_token: str, amount_usd: float) -> dict[str, Any]:
     """Create a payment charge via QuickBooks Payments API."""
     token = await qb_get_access_token()
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         resp = await client.post(
             f"{QB_API}/v3/company/{QB_REALM_ID}/payments/charge",
             json={
-                "amount": f"{PDF_PRICE_USD:.2f}",
+                "amount": f"{amount_usd:.2f}",
                 "capture": True,
                 "card": {
                     "token": card_token,
@@ -1165,7 +1257,7 @@ async def qb_create_charge(vin: str, card_token: str) -> dict[str, Any]:
             resp = await client.post(
                 f"{QB_API}/v3/company/{QB_REALM_ID}/payments/charge",
                 json={
-                    "amount": f"{PDF_PRICE_USD:.2f}",
+                    "amount": f"{amount_usd:.2f}",
                     "capture": True,
                     "card": {"token": card_token},
                     "description": f"Car Inspection Pro VIN Report PDF — {vin}",
@@ -1190,25 +1282,19 @@ async def pdf_checkout(request: Request, vin: str) -> dict[str, Any]:
     card_token = body.get("card_token")
     if not card_token:
         raise HTTPException(status_code=400, detail="card_token is required.")
+    plan = str(body.get("plan") or "").lower()
+    if plan and plan not in PLAN_PRICES:
+        raise HTTPException(
+            status_code=400, detail="Invalid plan. Must be basic, gold, or premium."
+        )
+    price_usd = PLAN_PRICES.get(plan, PDF_PRICE_USD)
+    reports = PLAN_REPORTS.get(plan, 1)
 
     await render_pdf(vin)
     prune_pending_orders()
 
-    if not QB_ENABLED:
-        order_id = f"demo-{uuid.uuid4().hex[:16]}"
-        PENDING_ORDERS[order_id] = {
-            "vin": vin,
-            "provider": "demo",
-            "created_at": time.time(),
-        }
-        return {
-            "order_id": order_id,
-            "provider": "demo",
-            "price_usd": PDF_PRICE_USD,
-        }
-
     try:
-        result = await qb_create_charge(vin, card_token)
+        result = await qb_create_charge(vin, card_token, price_usd)
     except httpx.HTTPStatusError as exc:
         logger.warning("QuickBooks charge failed for %s: %s", vin, exc.response.text)
         raise HTTPException(status_code=402, detail="Payment was declined.")
@@ -1221,12 +1307,15 @@ async def pdf_checkout(request: Request, vin: str) -> dict[str, Any]:
         "vin": vin,
         "provider": "quickbooks",
         "payment_id": payment_id,
+        "plan": plan,
         "created_at": time.time(),
     }
     return {
         "order_id": str(payment_id),
         "provider": "quickbooks",
-        "price_usd": PDF_PRICE_USD,
+        "price_usd": price_usd,
+        "plan": plan,
+        "reports": reports,
     }
 
 
@@ -1237,25 +1326,24 @@ async def pdf_capture(request: Request, vin: str, order_id: str) -> Response:
     order = PENDING_ORDERS.get(order_id)
     if not order or order.get("vin") != vin:
         raise HTTPException(status_code=403, detail="Unknown or mismatched payment order.")
-    if order["provider"] == "quickbooks":
-        payment_id = order.get("payment_id")
-        if payment_id:
-            token = await qb_get_access_token()
-            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-                resp = await client.get(
-                    f"{QB_API}/v3/company/{QB_REALM_ID}/payments/charge/{payment_id}",
-                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                )
-                if resp.ok:
-                    data = resp.json()
-                    status = data.get("payments", [{}])[0].get("status") if isinstance(data.get("payments"), list) else data.get("status")
-                    if status not in ("captured", "settled", "ChargeSuccessful", "ChargeCaptured", "SettledSuccessfully"):
-                        raise HTTPException(status_code=402, detail=f"Payment not yet completed (status: {status}).")
-    elif order["provider"] != "demo":
+    if order["provider"] != "quickbooks":
         raise HTTPException(status_code=403, detail="Unknown payment provider.")
+    payment_id = order.get("payment_id")
+    if payment_id:
+        token = await qb_get_access_token()
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                f"{QB_API}/v3/company/{QB_REALM_ID}/payments/charge/{payment_id}",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+            if resp.ok:
+                data = resp.json()
+                status = data.get("payments", [{}])[0].get("status") if isinstance(data.get("payments"), list) else data.get("status")
+                if status not in ("captured", "settled", "ChargeSuccessful", "ChargeCaptured", "SettledSuccessfully"):
+                    raise HTTPException(status_code=402, detail=f"Payment not yet completed (status: {status}).")
 
     pdf = await render_pdf(vin)
-    PENDING_ORDERS.pop(order_id, None)
+    prune_pending_orders()
     return Response(
         content=pdf,
         media_type="application/pdf",
@@ -1272,23 +1360,42 @@ async def qb_auth(request: Request) -> dict[str, str]:
     """Return QuickBooks OAuth authorization URL for one-time setup."""
     if not QB_CLIENT_ID:
         raise HTTPException(status_code=503, detail="QuickBooks Client ID not configured.")
-    state = secrets.token_urlsafe(16)
+    global QB_AUTH_STATE
+    QB_AUTH_STATE = secrets.token_urlsafe(32)
     auth_url = (
         f"https://appcenter.intuit.com/app/connect/oauth2"
         f"?client_id={QB_CLIENT_ID}"
         f"&response_type=code"
         f"&scope=com.intuit.quickbooks.payment"
         f"&redirect_uri={QB_REDIRECT_URI}"
-        f"&state={state}"
+        f"&state={QB_AUTH_STATE}"
     )
-    return {"authorization_url": auth_url, "state": state}
+    return {"authorization_url": auth_url, "state": QB_AUTH_STATE}
+
+
+@app.get("/api/quickbooks/status")
+@limiter.limit("60/minute")
+async def qb_status(request: Request) -> dict[str, Any]:
+    """Expose QuickBooks connectivity state for the frontend checkout."""
+    return {
+        "configured": bool(
+            QB_CLIENT_ID and QB_CLIENT_SECRET and QB_ACCESS_TOKEN and QB_REFRESH_TOKEN and QB_REALM_ID
+        ),
+        "client_id": QB_CLIENT_ID or None,
+        "env": QB_ENV,
+        "realm_id": QB_REALM_ID or None,
+    }
 
 
 @app.get("/api/quickbooks/callback")
-async def qb_callback(code: str = "", state: str = "") -> HTMLResponse:
-    """OAuth callback — exchanges code for access + refresh tokens."""
+async def qb_callback(code: str = "", state: str = "", error: str = "") -> HTMLResponse:
+    """OAuth callback — exchanges code for access + refresh tokens and persists them."""
+    if error:
+        return HTMLResponse(f"<h1>Authorization failed</h1><p>{error}</p>", status_code=400)
     if not code:
         return HTMLResponse("<h1>Authorization failed</h1><p>No authorization code received.</p>", status_code=400)
+    if not state or not QB_AUTH_STATE or not secrets.compare_digest(state, QB_AUTH_STATE):
+        return HTMLResponse("<h1>Authorization failed</h1><p>Invalid OAuth state.</p>", status_code=403)
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         resp = await client.post(
             "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
@@ -1305,21 +1412,25 @@ async def qb_callback(code: str = "", state: str = "") -> HTMLResponse:
         if not resp.ok:
             return HTMLResponse(f"<h1>Token exchange failed</h1><p>{resp.text}</p>", status_code=500)
         data = resp.json()
-    tokens = {
-        "access_token": data["access_token"],
-        "refresh_token": data["refresh_token"],
-    }
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>QuickBooks Connected</title>
+    global QB_ACCESS_TOKEN, QB_REFRESH_TOKEN, QB_REALM_ID
+    QB_ACCESS_TOKEN = data.get("access_token", "")
+    QB_REFRESH_TOKEN = data.get("refresh_token", "")
+    QB_REALM_ID = str(data.get("realmId") or QB_REALM_ID)
+    _save_qb_credentials(
+        client_id=QB_CLIENT_ID,
+        client_secret=QB_CLIENT_SECRET,
+        access_token=QB_ACCESS_TOKEN,
+        refresh_token=QB_REFRESH_TOKEN,
+        realm_id=QB_REALM_ID,
+    )
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>QuickBooks Connected</title>
 <style>body {{ font-family: system-ui; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; background:#f1f5f9; }}
-.box {{ background:#fff; padding:40px; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.08); text-align:center; max-width:480px; }}
-h1 {{ color:#0f172a; margin:0 0 12px; }} p {{ color:#64748b; }} .ok {{ color:#16a34a; font-weight:700; }}</style></head>
-<body><div class="box"><h1>QuickBooks Connected</h1><p class="ok">Authorization successful!</p>
-<p>Copy the tokens below and add them to your <code>.env</code> file on the server.</p>
-<h3 style="text-align:left; color:#0f172a;">QB_ACCESS_TOKEN</h3>
-<textarea style="width:100%;height:60px;font-family:monospace;font-size:11px;">{tokens['access_token']}</textarea>
-<h3 style="text-align:left; color:#0f172a;">QB_REFRESH_TOKEN</h3>
-<textarea style="width:100%;height:60px;font-family:monospace;font-size:11px;">{tokens['refresh_token']}</textarea>
-<p style="margin-top:16px;font-size:12px;">You can close this window after copying the tokens.</p>
-</div></body></html>"""
-    return HTMLResponse(html)
+.box {{ background:#fff; padding:40px; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.08); text-align:center; max-width:520px; }}
+h1 {{ color:#0f172a; margin:0 0 12px; }} p {{ color:#64748b; line-height:1.5; }} .ok {{ color:#16a34a; font-weight:700; }}
+code {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:2px 6px; }}</style></head>
+<body><div class="box"><h1>QuickBooks Connected</h1>
+<p class="ok">Authorization successful — tokens saved to the server.</p>
+<p>Realm / company ID: <code>{QB_REALM_ID}</code><br>Environment: <code>{QB_ENV}</code></p>
+<p>You can close this window. On-site card checkout is now enabled.</p>
+</div></body></html>""")

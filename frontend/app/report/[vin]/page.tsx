@@ -1,18 +1,11 @@
 "use client";
 
 import { use, useEffect, useState } from "react";
-import Script from "next/script";
 import Link from "next/link";
-import {
-  fetchVinReport,
-  startPdfCheckout,
-  capturePdf,
-  type VinReport,
-} from "@/lib/api";
+import { fetchVinReport, type VinReport } from "@/lib/api";
 import Navbar from "@/components/Navbar";
 
-const PDF_PRICE = process.env.NEXT_PUBLIC_PDF_PRICE;
-const QB_CLIENT_ID = process.env.NEXT_PUBLIC_QB_CLIENT_ID ?? "";
+const PLANS_FROM_USD = 45;
 
 type Stat = {
   label: string;
@@ -30,9 +23,6 @@ export default function ReportPage({ params }: { params: Promise<{ vin: string }
   const [vin, setVin] = useState<string>(initialVin);
   const [report, setReport] = useState<VinReport | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [checkoutError, setCheckoutError] = useState<string | null>(null);
-  const [showCardForm, setShowCardForm] = useState(false);
-  const [processingPayment, setProcessingPayment] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -41,51 +31,6 @@ export default function ReportPage({ params }: { params: Promise<{ vin: string }
       .catch((err: Error) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
   }, [initialVin]);
-
-  const handleDownload = async () => {
-    setShowCardForm(true);
-  };
-
-  const handlePayWithCard = async () => {
-    setProcessingPayment(true);
-    setCheckoutError(null);
-    try {
-      let cardToken = "demo-card-token";
-
-      if (typeof window !== "undefined" && (window as any).IntuitPayments) {
-        const card = {
-          number: (document.getElementById("qb-card-number") as HTMLInputElement)?.value || "",
-          expMonth: (document.getElementById("qb-card-month") as HTMLInputElement)?.value || "",
-          expYear: (document.getElementById("qb-card-year") as HTMLInputElement)?.value || "",
-          cvv: (document.getElementById("qb-card-cvv") as HTMLInputElement)?.value || "",
-        };
-        const tokenResult = await new Promise<{ card: { token: string } }>((resolve, reject) => {
-          (window as any).IntuitPayments.cards.createToken(card, (err: any, token: any) => {
-            if (err) reject(err);
-            else resolve(token);
-          });
-        });
-        cardToken = tokenResult.card.token;
-      }
-
-      const checkout = await startPdfCheckout(vin, cardToken);
-      const result = await capturePdf(vin, checkout.order_id);
-      const blob = result as Blob;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${vin}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      setShowCardForm(false);
-    } catch (err) {
-      setCheckoutError(err instanceof Error ? err.message : "Payment failed.");
-    } finally {
-      setProcessingPayment(false);
-    }
-  };
 
   const vehicle = report?.vehicle;
   const statuses = report?.statuses ?? {};
@@ -236,19 +181,18 @@ export default function ReportPage({ params }: { params: Promise<{ vin: string }
 
                 <div className="flex shrink-0 items-center gap-4">
                   <div className="text-right">
-                    <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Full PDF Report</p>
-                    {PDF_PRICE && <p className="mt-0.5 text-2xl font-extrabold text-slate-900">${PDF_PRICE}</p>}
+                    <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Plans Starting At</p>
+                    <p className="mt-0.5 text-2xl font-extrabold text-slate-900">${PLANS_FROM_USD}</p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleDownload}
+                  <Link
+                    href={`/plans/${vin}`}
                     className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-6 py-3 text-sm font-bold text-white shadow-md shadow-blue-600/20 transition-all hover:bg-blue-700 hover:shadow-lg"
                   >
                     <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
                       <path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                     </svg>
-                    Download Report
-                  </button>
+                    Get Full Report
+                  </Link>
                 </div>
               </div>
 
@@ -407,11 +351,9 @@ export default function ReportPage({ params }: { params: Promise<{ vin: string }
                 <div className="lg:sticky lg:top-6">
                   <div className="overflow-hidden border border-blue-200 bg-white shadow-sm">
                     <div className="bg-blue-600 px-6 py-5 text-center">
-                      <p className="text-[11px] font-bold uppercase tracking-widest text-blue-200">Full Vehicle History</p>
-                      {PDF_PRICE && (
-                        <p className="mt-2 text-4xl font-extrabold text-white">${PDF_PRICE}</p>
-                      )}
-                      <p className="mt-1 text-sm text-blue-100">one-time purchase</p>
+                      <p className="text-[11px] font-bold uppercase tracking-widest text-blue-200">Plan Price Starting At</p>
+                      <p className="mt-2 text-4xl font-extrabold text-white">${PLANS_FROM_USD}</p>
+                      <p className="mt-1 text-sm text-blue-100">1–3 reports per plan</p>
                     </div>
 
                     <div className="px-6 py-5">
@@ -436,20 +378,16 @@ export default function ReportPage({ params }: { params: Promise<{ vin: string }
                         ))}
                       </ul>
 
-                      <button
-                        type="button"
-                        onClick={handleDownload}
+                      <Link
+                        href={`/plans/${vin}`}
                         className="mt-6 flex w-full items-center justify-center gap-2 bg-blue-600 px-6 py-3.5 text-sm font-bold text-white shadow-md shadow-blue-600/20 transition-all hover:bg-blue-700 hover:shadow-lg"
                       >
                         <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
                           <path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                         </svg>
-                        Download Full Report
-                      </button>
-                      {checkoutError && (
-                        <p className="mt-2 text-center text-xs font-medium text-rose-500">{checkoutError}</p>
-                      )}
-                      <p className="mt-3 text-center text-[11px] text-slate-400">Instant download &middot; Secure payment</p>
+                        Buy a Plan &amp; Download
+                      </Link>
+                      <p className="mt-3 text-center text-[11px] text-slate-400">Instant download &middot; Secure payment via QuickBooks</p>
                     </div>
                   </div>
 
@@ -474,84 +412,6 @@ export default function ReportPage({ params }: { params: Promise<{ vin: string }
             </div>
 
           </>
-        )}
-
-        {/* ---- CARD PAYMENT MODAL ---- */}
-        {showCardForm && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4" onClick={() => { if (!processingPayment) setShowCardForm(false); }}>
-            <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl" onClick={(e) => e.stopPropagation()}>
-              <Script
-                src="https://js.intuit.com/IntuitPayments/3.0.0/intuit payments.js"
-                strategy="lazyOnload"
-                onLoad={() => {
-                  if (QB_CLIENT_ID && typeof (window as any).IntuitPayments !== "undefined") {
-                    (window as any).IntuitPayments.init({ intuitApiKey: QB_CLIENT_ID, environment: "sandbox" });
-                  }
-                }}
-              />
-              <div className="border-b border-slate-200 px-6 py-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-bold text-slate-900">Complete Payment</h2>
-                  {!processingPayment && (
-                    <button type="button" onClick={() => setShowCardForm(false)} className="text-slate-400 hover:text-slate-600">
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-                    </button>
-                  )}
-                </div>
-              </div>
-              <div className="px-6 py-5">
-                <div className="mb-4 rounded-lg bg-slate-50 p-4 text-center">
-                  <p className="text-sm text-slate-500">Vehicle History Report</p>
-                  <p className="mt-1 text-2xl font-extrabold text-slate-900">${PDF_PRICE}</p>
-                  <p className="text-xs text-slate-400">VIN: {vin}</p>
-                </div>
-
-                <div className="space-y-3">
-                  <div>
-                    <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">Card Number</label>
-                    <input id="qb-card-number" type="text" placeholder="4242 4242 4242 4242" className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm font-mono text-slate-900 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" maxLength={19} />
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">Expiry</label>
-                      <div className="grid grid-cols-2 gap-2">
-                        <input id="qb-card-month" type="text" placeholder="MM" className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm font-mono text-slate-900 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" maxLength={2} />
-                        <input id="qb-card-year" type="text" placeholder="YY" className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm font-mono text-slate-900 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" maxLength={2} />
-                      </div>
-                    </div>
-                    <div>
-                      <label className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">CVV</label>
-                      <input id="qb-card-cvv" type="text" placeholder="123" className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm font-mono text-slate-900 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" maxLength={4} />
-                    </div>
-                  </div>
-                </div>
-
-                {checkoutError && (
-                  <p className="mt-3 text-center text-sm font-medium text-rose-500">{checkoutError}</p>
-                )}
-
-                <button
-                  type="button"
-                  onClick={handlePayWithCard}
-                  disabled={processingPayment}
-                  className="mt-5 flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-6 py-3.5 text-sm font-bold text-white shadow-md transition-all hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {processingPayment ? (
-                    <>
-                      <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                      Processing…
-                    </>
-                  ) : (
-                    <>
-                      Pay ${PDF_PRICE} &amp; Download PDF
-                    </>
-                  )}
-                </button>
-
-                <p className="mt-3 text-center text-[11px] text-slate-400">Secure payment via QuickBooks &middot; SSL encrypted</p>
-              </div>
-            </div>
-          </div>
         )}
       </main>
     </div>
