@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -41,6 +42,7 @@ REPORT_CACHE = TTLCache(ttl_seconds=3600, max_items=5000)
 LOOKUP_CACHE = TTLCache(ttl_seconds=86400, max_items=20000)
 PDF_CACHE = TTLCache(ttl_seconds=3600, max_items=2000)
 PENDING_ORDERS: dict[str, dict[str, Any]] = {}
+WHOP_ORDERS: dict[str, dict[str, Any]] = {}
 
 
 logging.basicConfig(level=logging.INFO)
@@ -143,6 +145,16 @@ QB_AUTH_STATE: str = ""
 PDF_PRICE_USD = float(os.getenv("PDF_PRICE_USD", "55.00"))
 PLAN_PRICES = {"basic": 45.00, "gold": 65.00, "premium": 85.00}
 PLAN_REPORTS = {"basic": 1, "gold": 2, "premium": 3}
+
+WHOP_API_KEY = os.getenv("WHOP_API_KEY", "")
+WHOP_WEBHOOK_SECRET = os.getenv("WHOP_WEBHOOK_SECRET", "")
+WHOP_BUSINESS_ID = os.getenv("WHOP_BUSINESS_ID", "")
+WHOP_PLAN_IDS = {
+    "basic": os.getenv("WHOP_PLAN_BASIC", ""),
+    "gold": os.getenv("WHOP_PLAN_GOLD", ""),
+    "premium": os.getenv("WHOP_PLAN_PREMIUM", ""),
+}
+WHOP_RETURN_BASE = os.getenv("WHOP_RETURN_BASE", "https://carinspectionpro.com")
 
 GLOBALVIN_API_KEY = os.getenv("GLOBALVIN_API_KEY", "")
 GLOBALVIN_BASE_URL = os.getenv("GLOBALVIN_BASE_URL", "https://globalvin.co/backend")
@@ -1350,6 +1362,254 @@ async def pdf_capture(request: Request, vin: str, order_id: str) -> Response:
         media_type="application/pdf",
         headers={
             "Content-Disposition": f'attachment; filename="{vin}.pdf"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# ============================================================
+# Whop checkout + webhooks
+# ============================================================
+WHOP_ORDERS_FILE = Path(__file__).resolve().parent / "data" / "whop_orders.json"
+
+
+def _load_whop_orders() -> None:
+    try:
+        with open(WHOP_ORDERS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            WHOP_ORDERS.update({k: v for k, v in data.items() if isinstance(v, dict)})
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("Could not load %s: %s", WHOP_ORDERS_FILE, exc)
+
+
+def _save_whop_orders() -> None:
+    try:
+        WHOP_ORDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = WHOP_ORDERS_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(WHOP_ORDERS, fh)
+        tmp.replace(WHOP_ORDERS_FILE)
+    except Exception as exc:
+        logger.warning("Could not save %s: %s", WHOP_ORDERS_FILE, exc)
+
+
+_load_whop_orders()
+
+
+def prune_whop_orders() -> None:
+    now = time.time()
+    stale = [k for k, o in WHOP_ORDERS.items() if now - o.get("created_at", 0) > 6 * 3600]
+    for k in stale:
+        WHOP_ORDERS.pop(k, None)
+    if stale:
+        _save_whop_orders()
+
+
+def whop_verify_signature(body: bytes, headers: dict) -> bool:
+    """Verify a Standard Webhooks v1 HMAC-SHA256 signature (webhook-id / webhook-timestamp / webhook-signature)."""
+    msg_id = headers.get("webhook-id", "")
+    timestamp = headers.get("webhook-timestamp", "")
+    sig_header = headers.get("webhook-signature", "")
+    if not msg_id or not timestamp or not sig_header:
+        return False
+    signed_content = f"{msg_id}.{timestamp}." + body.decode("utf-8", "replace")
+    try:
+        key = base64.b64decode(WHOP_WEBHOOK_SECRET)
+    except Exception:
+        key = WHOP_WEBHOOK_SECRET.encode()
+    expected = base64.b64encode(hmac.new(key, signed_content.encode(), hashlib.sha256).digest()).decode()
+    for part in sig_header.split(","):
+        part = part.strip()
+        if "=" in part:
+            _, sig = part.split("=", 1)
+        else:
+            sig = part
+        if hmac.compare_digest(sig.strip(), expected):
+            return True
+    return False
+
+
+PAYMENT_OK_STATUSES = {"succeeded", "captured", "paid", "completed", "settled", "closed", "fulfilled", "processed"}
+
+
+async def whop_fetch_payment(payment_id: str) -> dict | None:
+    """Fetch a Whop payment by id. Returns the payment object, or None if it can't be confirmed."""
+    if not WHOP_API_KEY or not payment_id:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                f"https://api.whop.com/api/v1/payments/{payment_id}",
+                headers={"Authorization": f"Bearer {WHOP_API_KEY}", "Accept": "application/json"},
+            )
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+    except Exception as exc:
+        logger.warning("Whop payment verification error for %s: %s", payment_id, exc)
+        return None
+
+
+def whop_payment_matches(payment: dict | None, order_id: str) -> bool:
+    """Strict check: payment exists, succeeded, belongs to our company, and is bound to this exact order.
+
+    Requiring payment.metadata.order_id == order_id defeats the reuse attack where an
+    attacker pays for (or references) a cheap/foreign payment and uses its id to mark a
+    different order as paid.
+    """
+    if not payment:
+        return False
+    if str(payment.get("status") or "") not in PAYMENT_OK_STATUSES:
+        return False
+    company = payment.get("company") or {}
+    company_id = company.get("id") if isinstance(company, dict) else None
+    if WHOP_BUSINESS_ID and company_id and company_id != WHOP_BUSINESS_ID:
+        return False
+    meta = payment.get("metadata") or {}
+    return isinstance(meta, dict) and meta.get("order_id") == order_id
+
+
+async def whop_create_checkout_config(plan_id: str, metadata: dict, redirect_url: str) -> str | None:
+    """Create a Whop checkout configuration whose metadata is inherited by the resulting payment."""
+    if not WHOP_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.post(
+                "https://api.whop.com/api/v1/checkout_configurations",
+                headers={"Authorization": f"Bearer {WHOP_API_KEY}", "Accept": "application/json"},
+                json={"plan_id": plan_id, "metadata": metadata, "redirect_url": redirect_url},
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning("Whop checkout config create failed %s: %s", resp.status_code, resp.text)
+                return None
+            url = (resp.json().get("purchase_url") or "").strip()
+            if url.startswith("/"):
+                url = "https://whop.com" + url
+            return url or None
+    except Exception as exc:
+        logger.warning("Whop checkout config create error: %s", exc)
+        return None
+
+
+@app.post("/api/whop/checkout")
+@limiter.limit("15/minute")
+async def whop_checkout(request: Request) -> dict[str, Any]:
+    """Create a pending order and return a Whop checkout URL carrying our metadata."""
+    body = await request.json()
+    vin = validate_vin(str(body.get("vin") or ""))
+    plan = str(body.get("plan") or "").lower()
+    if plan not in PLAN_PRICES:
+        raise HTTPException(status_code=400, detail="Invalid plan. Must be basic, gold, or premium.")
+    whop_plan_id = WHOP_PLAN_IDS.get(plan)
+    if not whop_plan_id:
+        raise HTTPException(status_code=503, detail="Whop plan is not configured on the server.")
+    prune_whop_orders()
+    price_usd = PLAN_PRICES[plan]
+    order_id = "whop_" + secrets.token_urlsafe(10)
+    metadata = {"order_id": order_id, "vin": vin, "plan": plan}
+    return_url = (
+        f"{WHOP_RETURN_BASE}/thankyou"
+        f"?order={order_id}&vin={quote(vin)}&plan={plan}&name={plan.capitalize()}&price={price_usd}"
+    )
+    checkout_url = await whop_create_checkout_config(whop_plan_id, metadata, return_url)
+    if not checkout_url:
+        raise HTTPException(status_code=502, detail="Could not start Whop checkout. Please try again.")
+    WHOP_ORDERS[order_id] = {
+        "vin": vin,
+        "plan": plan,
+        "provider": "whop",
+        "status": "pending",
+        "payment_id": None,
+        "created_at": time.time(),
+    }
+    _save_whop_orders()
+    return {
+        "checkout_url": checkout_url,
+        "order_id": order_id,
+        "provider": "whop",
+        "plan": plan,
+        "price_usd": price_usd,
+    }
+
+
+@app.post("/api/whop/webhook")
+async def whop_webhook(request: Request) -> Response:
+    """Receive Whop events (payment.succeeded) and mark orders as paid."""
+    body_bytes = await request.body()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    if WHOP_WEBHOOK_SECRET:
+        if not whop_verify_signature(body_bytes, headers):
+            logger.warning("Whop webhook rejected: bad signature")
+            raise HTTPException(status_code=401, detail="Invalid webhook signature.")
+    else:
+        logger.info("Whop webhook secret not set — falling back to Whop API payment verification.")
+    try:
+        event = json.loads(body_bytes.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+    event_type = event.get("type")
+    data = event.get("data") or {}
+    if event_type == "payment.succeeded":
+        order_id = (data.get("metadata") or {}).get("order_id")
+        order = WHOP_ORDERS.get(order_id) if order_id else None
+        if not order:
+            logger.warning("Whop payment.succeeded received for unknown order_id=%s", order_id)
+            return Response(status_code=200)
+        verified = True
+        if WHOP_API_KEY:
+            payment_id = data.get("id", "")
+            payment = await whop_fetch_payment(payment_id)
+            verified = whop_payment_matches(payment, order_id)
+            if verified:
+                logger.info("Whop payment %s verified via API for order %s", payment_id, order_id)
+            else:
+                logger.warning("Whop payment %s could NOT be verified for order %s — stays pending", payment_id, order_id)
+        if verified:
+            order["status"] = "paid"
+            order["payment_id"] = data.get("id")
+            order["paid_at"] = time.time()
+            _save_whop_orders()
+        else:
+            raise HTTPException(status_code=500, detail="Payment could not be verified at Whop.")
+    return Response(status_code=200)
+
+
+@app.get("/api/whop/order/{order_id}")
+async def whop_order_status(request: Request, order_id: str) -> dict[str, Any]:
+    order = WHOP_ORDERS.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    return {
+        "order_id": order_id,
+        "vin": order["vin"],
+        "plan": order["plan"],
+        "status": order["status"],
+        "price_usd": PLAN_PRICES.get(order["plan"], PDF_PRICE_USD),
+    }
+
+
+@app.get("/api/whop/report/{order_id}")
+async def whop_report(request: Request, order_id: str) -> Response:
+    """Serve the report PDF once the Whop payment has been confirmed by webhook."""
+    order = WHOP_ORDERS.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    if order["status"] != "paid":
+        raise HTTPException(status_code=403, detail="Payment not confirmed yet.")
+    if not WHOP_WEBHOOK_SECRET and WHOP_API_KEY:
+        payment = await whop_fetch_payment(order.get("payment_id") or "")
+        if not whop_payment_matches(payment, order_id):
+            raise HTTPException(status_code=403, detail="Payment is not confirmed at Whop yet.")
+    pdf = await render_pdf(order["vin"], order["plan"])
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{order["vin"]}.pdf"',
             "Cache-Control": "no-store",
         },
     )

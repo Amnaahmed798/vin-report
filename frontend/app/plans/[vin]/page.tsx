@@ -1,13 +1,15 @@
 "use client";
 
 import { use, useEffect, useState, useCallback } from "react";
-import { useRouter } from "next/navigation";
 import Link from "next/link";
 import Navbar from "@/components/Navbar";
-import CheckoutModal, { type CheckoutPlan } from "@/components/CheckoutModal";
-import { fetchVinDecode, fetchQuickBooksStatus, type QuickBooksStatus, type PdfCheckoutResult, type VinDecode } from "@/lib/api";
+import { fetchVinDecode, whopCheckout, type VinDecode } from "@/lib/api";
 
-type Plan = CheckoutPlan & {
+type Plan = {
+  id: string;
+  name: string;
+  price: number;
+  reports: number;
   badge?: string;
   color: string;
   features: string[];
@@ -105,14 +107,12 @@ function SpecCell({ label, value }: { label: string; value?: string }) {
 export default function PlansPage({ params }: { params: Promise<{ vin: string }> }) {
   const { vin: rawVin } = use(params);
   const vin = decodeURIComponent(rawVin).toUpperCase();
-  const router = useRouter();
 
   const [vehicle, setVehicle] = useState<VinDecode["vehicle"] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  const [checkoutPlan, setCheckoutPlan] = useState<Plan | null>(null);
-  const [qbStatus, setQbStatus] = useState<QuickBooksStatus | null>(null);
+  const [checkoutPlanId, setCheckoutPlanId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -131,28 +131,6 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
     };
   }, [vin]);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetchQuickBooksStatus()
-      .then((status) => {
-        if (!cancelled) setQbStatus(status);
-      })
-      .catch(() => {
-        if (!cancelled) setQbStatus({ configured: false, env: "sandbox", client_id: null, realm_id: null });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  function refreshStatus() {
-    fetchQuickBooksStatus()
-      .then(setQbStatus)
-      .catch(() =>
-        setQbStatus({ configured: false, env: "sandbox", client_id: null, realm_id: null }),
-      );
-  }
-
   const copyVin = useCallback(() => {
     navigator.clipboard.writeText(vin).then(() => {
       setCopied(true);
@@ -160,11 +138,17 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
     });
   }, [vin]);
 
-  function handlePaid(result: PdfCheckoutResult, plan: CheckoutPlan) {
-    setCheckoutPlan(null);
-    router.push(
-      `/thankyou?vin=${encodeURIComponent(vin)}&order=${encodeURIComponent(result.order_id)}&plan=${plan.id}&name=${plan.name}&price=${plan.price}`,
-    );
+  function handleBuyNow(plan: Plan) {
+    if (checkoutPlanId) return;
+    setCheckoutPlanId(plan.id);
+    whopCheckout(vin, plan.id)
+      .then((res) => {
+        window.location.href = res.checkout_url;
+      })
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : "Could not start checkout. Please try again.");
+        setCheckoutPlanId(null);
+      });
   }
 
   const vehicleLabel = vehicle
@@ -398,11 +382,19 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
-                          setCheckoutPlan(plan);
+                          handleBuyNow(plan);
                         }}
-                        className="w-full rounded-xl bg-blue-600 py-3 text-sm font-bold text-white shadow-md shadow-blue-600/20 transition-all hover:bg-blue-700 hover:shadow-lg"
+                        disabled={checkoutPlanId !== null}
+                        className="w-full rounded-xl bg-blue-600 py-3 text-sm font-bold text-white shadow-md shadow-blue-600/20 transition-all hover:bg-blue-700 hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-70"
                       >
-                        Buy Now
+                        {checkoutPlanId === plan.id ? (
+                          <span className="inline-flex items-center justify-center gap-2">
+                            <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+                            Opening secure checkout…
+                          </span>
+                        ) : (
+                          "Buy Now"
+                        )}
                       </button>
                     </div>
                   </div>
@@ -413,7 +405,7 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
             {/* Checkout note */}
             <div className="mt-6">
               <p className="text-center text-xs text-slate-400">
-                Secure checkout powered by QuickBooks — pay right here, no new tab
+                Secure checkout powered by Whop — pay on Whop&apos;s hosted page, then download your report
               </p>
             </div>
 
@@ -423,7 +415,7 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4 text-emerald-500">
                   <path fillRule="evenodd" d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zm3 8V5.5a3 3 0 10-6 0V9h6z" clipRule="evenodd" />
                 </svg>
-                Secure payment via QuickBooks
+                Secure payment via Whop
               </span>
               <span>No account required</span>
               <span>Instant PDF download</span>
@@ -431,18 +423,6 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
           </>
         )}
       </main>
-
-      <CheckoutModal
-        vin={vin}
-        plan={checkoutPlan}
-        clientId={qbStatus?.client_id ?? null}
-        configured={qbStatus?.configured ?? false}
-        env={qbStatus?.env ?? "sandbox"}
-        open={checkoutPlan !== null}
-        onPaid={handlePaid}
-        onClose={() => setCheckoutPlan(null)}
-        onRefreshStatus={refreshStatus}
-      />
     </div>
   );
 }

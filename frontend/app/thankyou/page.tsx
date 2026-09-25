@@ -1,10 +1,13 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import Navbar from "@/components/Navbar";
-import { capturePdf, downloadBlob } from "@/lib/api";
+import { downloadBlob, whopDownload, whopOrderStatus } from "@/lib/api";
+
+const POLL_INTERVAL_MS = 2500;
+const POLL_TIMEOUT_MS = 120000;
 
 function ThankYouBody() {
   const params = useSearchParams();
@@ -13,17 +16,63 @@ function ThankYouBody() {
   const planName = params.get("name") ?? "";
   const planPrice = params.get("price") ?? "";
 
+  const [payable, setPayable] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [orderError, setOrderError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [downloadDone, setDownloadDone] = useState(false);
+  const startedAtRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!orderId) return;
+    startedAtRef.current = Date.now();
+    setConfirming(true);
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const status = await whopOrderStatus(orderId);
+        if (cancelled) return;
+        if (status.status === "paid") {
+          setPayable(true);
+          setConfirming(false);
+          return;
+        }
+      } catch {
+        if (cancelled) return;
+        setOrderError(null);
+      }
+
+      if (Date.now() - (startedAtRef.current ?? 0) > POLL_TIMEOUT_MS) {
+        setConfirming(false);
+        setOrderError(
+          "We're still waiting for Whop to confirm your payment. It usually takes a few seconds — check back shortly.",
+        );
+        return;
+      }
+      timer = setTimeout(poll, POLL_INTERVAL_MS);
+    };
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [orderId]);
 
   async function handleDownload() {
-    if (!vin || !orderId || downloading) return;
+    if (!orderId || downloading || !payable) return;
     setDownloading(true);
     setDownloadError(null);
     try {
-      const pdf = await capturePdf(vin, orderId);
-      downloadBlob(pdf, `${vin}.pdf`);
+      const blob = await whopDownload(orderId);
+      const filename = vin ? `${vin}.pdf` : "vehicle-report.pdf";
+      downloadBlob(blob, filename);
       setDownloadDone(true);
     } catch (err) {
       setDownloadError(err instanceof Error ? err.message : "Download failed. Please try again.");
@@ -44,7 +93,7 @@ function ThankYouBody() {
           </div>
 
           <h1 className="mt-5 text-xl font-bold text-slate-900">
-            {orderId ? "Payment Successful — Thank You!" : "Thank You"}
+            {orderId ? (payable ? "Payment Successful — Thank You!" : "Thank You!") : "Thank You"}
           </h1>
 
           {(vin || planName) && (
@@ -62,7 +111,18 @@ function ThankYouBody() {
             </div>
           )}
 
-          {orderId ? (
+          {orderId && confirming && (
+            <>
+              <div className="mt-6 flex flex-col items-center gap-3">
+                <span className="h-8 w-8 animate-spin rounded-full border-4 border-blue-200 border-t-blue-600" />
+                <p className="text-sm leading-relaxed text-slate-500">
+                  Confirming your payment with Whop…
+                </p>
+              </div>
+            </>
+          )}
+
+          {orderId && payable && (
             <>
               <p className="mt-4 text-sm leading-relaxed text-slate-500">
                 Your payment was confirmed and your vehicle history report is ready.
@@ -100,19 +160,34 @@ function ThankYouBody() {
                 <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5">
                   <p className="text-xs font-semibold text-red-700">{downloadError}</p>
                   <p className="mt-1 text-[11px] text-red-600">
-                    If this keeps happening, a copy will also be emailed to you once your order is confirmed.
+                    If this keeps happening, refresh the page in a moment and try again.
                   </p>
                 </div>
               )}
 
               <p className="mt-4 text-xs leading-relaxed text-slate-400">
-                We&apos;ll also email your report to the address you provided at checkout.
+                Your download link stays active for a while after your purchase.
               </p>
             </>
-          ) : (
+          )}
+
+          {orderId && !confirming && !payable && orderError && (
+            <div className="mt-5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5">
+              <p className="text-xs font-semibold text-amber-800">{orderError}</p>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="mt-2 inline-block text-xs font-bold text-blue-600 hover:underline"
+              >
+                Refresh
+              </button>
+            </div>
+          )}
+
+          {!orderId && (
             <p className="mt-4 text-sm leading-relaxed text-slate-500">
               We couldn&apos;t find an order linked to this page. If you just made a purchase,
-              your report will be emailed to you shortly.
+              go back and try again.
             </p>
           )}
 

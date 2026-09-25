@@ -273,6 +273,50 @@ export function getQuickBooksAuthUrl(): string {
   return `${API_BASE}/api/quickbooks/auth`;
 }
 
+export type WhopCheckoutResult = {
+  checkout_url: string;
+  order_id: string;
+  provider: string;
+  plan: string;
+  price_usd: number;
+};
+
+export async function whopCheckout(vin: string, plan: string): Promise<WhopCheckoutResult> {
+  const res = await fetch(`${API_BASE}/api/whop/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ vin, plan }),
+  });
+  if (!res.ok) {
+    throw new Error(await readDetail(res));
+  }
+  return res.json();
+}
+
+export type WhopOrderStatus = {
+  order_id: string;
+  vin: string;
+  plan: string;
+  status: "pending" | "paid";
+  price_usd: number;
+};
+
+export async function whopOrderStatus(orderId: string): Promise<WhopOrderStatus> {
+  const res = await fetch(`${API_BASE}/api/whop/order/${encodeURIComponent(orderId)}`);
+  if (!res.ok) {
+    throw new Error(await readDetail(res));
+  }
+  return res.json();
+}
+
+export async function whopDownload(orderId: string): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/api/whop/report/${encodeURIComponent(orderId)}`);
+  if (!res.ok) {
+    throw new Error(await readDetail(res));
+  }
+  return res.blob();
+}
+
 const VIN_TRANSLITERATION: Record<string, number> = {
   "0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
   A: 1, B: 2, C: 3, D: 4, E: 5, F: 6, G: 7, H: 8,
