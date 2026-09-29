@@ -1408,6 +1408,24 @@ def prune_whop_orders() -> None:
         _save_whop_orders()
 
 
+def _whop_sign_key(secret: str) -> bytes | None:
+    """Derive the HMAC key from a Whop webhook secret.
+
+    whsec_*  -> Standard Webhooks format: base64-decode the part after the prefix
+    ws_*/any -> used as-is (raw bytes), per Whop's sandbox behaviour.
+    """
+    if not secret:
+        return None
+    if secret.startswith("whsec_"):
+        trimmed = secret[len("whsec_"):]
+        trimmed += "=" * (-len(trimmed) % 4)
+        try:
+            return base64.b64decode(trimmed, validate=True)
+        except Exception:
+            return None
+    return secret.encode()
+
+
 def whop_verify_signature(body: bytes, headers: dict) -> bool:
     """Verify a Standard Webhooks v1 HMAC-SHA256 signature (webhook-id / webhook-timestamp / webhook-signature)."""
     msg_id = headers.get("webhook-id", "")
@@ -1415,18 +1433,21 @@ def whop_verify_signature(body: bytes, headers: dict) -> bool:
     sig_header = headers.get("webhook-signature", "")
     if not msg_id or not timestamp or not sig_header:
         return False
-    signed_content = f"{msg_id}.{timestamp}." + body.decode("utf-8", "replace")
     try:
-        key = base64.b64decode(WHOP_WEBHOOK_SECRET)
+        if abs(int(time.time()) - int(timestamp)) > 300:
+            return False
     except Exception:
-        key = WHOP_WEBHOOK_SECRET.encode()
+        return False
+    signed_content = f"{msg_id}.{timestamp}." + body.decode("utf-8", "replace")
+    key = _whop_sign_key(WHOP_WEBHOOK_SECRET)
+    if key is None:
+        return False
     expected = base64.b64encode(hmac.new(key, signed_content.encode(), hashlib.sha256).digest()).decode()
-    for part in sig_header.split(","):
-        part = part.strip()
-        if "=" in part:
-            _, sig = part.split("=", 1)
-        else:
-            sig = part
+    for chunk in sig_header.split(" "):
+        chunk = chunk.strip()
+        version, _, sig = chunk.partition(",")
+        if version != "v1":
+            continue
         if hmac.compare_digest(sig.strip(), expected):
             return True
     return False
