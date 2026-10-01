@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import func, or_
@@ -43,6 +43,10 @@ LOOKUP_CACHE = TTLCache(ttl_seconds=86400, max_items=20000)
 PDF_CACHE = TTLCache(ttl_seconds=3600, max_items=2000)
 PENDING_ORDERS: dict[str, dict[str, Any]] = {}
 WHOP_ORDERS: dict[str, dict[str, Any]] = {}
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+REPORT_DATA_DIR = DATA_DIR / "reports"
+PDF_DIR = DATA_DIR / "pdfs"
 
 
 logging.basicConfig(level=logging.INFO)
@@ -556,6 +560,10 @@ async def build_report(vin: str) -> VinReport:
     cached = REPORT_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    disk = _load_report_disk(vin)
+    if disk is not None:
+        REPORT_CACHE.set(cache_key, disk)
+        return disk
 
     report = VinReport(vin=vin)
 
@@ -605,6 +613,7 @@ async def build_report(vin: str) -> VinReport:
         report.statuses = statuses
 
     REPORT_CACHE.set(cache_key, report)
+    _save_report_disk(vin, report)
     return report
 
 
@@ -1125,6 +1134,10 @@ async def render_pdf(vin: str, plan_id: str = "gold") -> bytes:
     cached = PDF_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    disk_pdf = _load_pdf_disk(vin, plan_id)
+    if disk_pdf is not None:
+        PDF_CACHE.set(cache_key, disk_pdf)
+        return disk_pdf
     report = await build_report(vin)
     report_data = report.model_dump()
     report_no = make_report_number(vin)
@@ -1172,7 +1185,54 @@ async def render_pdf(vin: str, plan_id: str = "gold") -> bytes:
         )
     pdf = protect_pdf(pdf)
     PDF_CACHE.set(cache_key, pdf)
+    _save_pdf_disk(vin, plan_id, pdf)
     return pdf
+
+
+def _load_report_disk(vin: str) -> VinReport | None:
+    try:
+        with open(REPORT_DATA_DIR / f"{vin}.json", "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        report = VinReport.model_validate(data)
+        return report
+    except (FileNotFoundError, json.JSONDecodeError, ValidationError, OSError):
+        return None
+    except Exception as exc:
+        logger.warning("Could not load cached report for %s: %s", vin, exc)
+        return None
+
+
+def _save_report_disk(vin: str, report: VinReport) -> None:
+    try:
+        REPORT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = REPORT_DATA_DIR / f"{vin}.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(report.model_dump(), fh)
+        tmp.replace(REPORT_DATA_DIR / f"{vin}.json")
+    except Exception as exc:
+        logger.warning("Could not persist report for %s: %s", vin, exc)
+
+
+def _load_pdf_disk(vin: str, plan_id: str) -> bytes | None:
+    try:
+        with open(PDF_DIR / f"{vin}_{plan_id}.pdf", "rb") as fh:
+            return fh.read()
+    except (FileNotFoundError, OSError):
+        return None
+    except Exception as exc:
+        logger.warning("Could not load cached PDF for %s (%s): %s", vin, plan_id, exc)
+        return None
+
+
+def _save_pdf_disk(vin: str, plan_id: str, pdf: bytes) -> None:
+    try:
+        PDF_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PDF_DIR / f"{vin}_{plan_id}.pdf.tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(pdf)
+        tmp.replace(PDF_DIR / f"{vin}_{plan_id}.pdf")
+    except Exception as exc:
+        logger.warning("Could not persist PDF for %s (%s): %s", vin, plan_id, exc)
 
 
 async def _pregen_report(vin: str, plan: str) -> None:
