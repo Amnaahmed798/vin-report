@@ -310,11 +310,19 @@ export async function whopOrderStatus(orderId: string): Promise<WhopOrderStatus>
 }
 
 export async function whopDownload(orderId: string): Promise<Blob> {
-  const res = await fetch(`${API_BASE}/api/whop/report/${encodeURIComponent(orderId)}`);
-  if (!res.ok) {
+  const deadline = Date.now() + 180000;
+  while (Date.now() < deadline) {
+    const res = await fetch(`${API_BASE}/api/whop/report/${encodeURIComponent(orderId)}`);
+    if (res.ok) {
+      return res.blob();
+    }
+    if (res.status === 202) {
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
     throw new Error(await readDetail(res));
   }
-  return res.blob();
+  throw new Error("The report is still being prepared. Please refresh the page and try again.");
 }
 
 const VIN_TRANSLITERATION: Record<string, number> = {

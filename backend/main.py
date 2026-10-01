@@ -19,7 +19,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ValidationError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -44,6 +44,7 @@ PDF_CACHE = TTLCache(ttl_seconds=3600, max_items=2000)
 PENDING_ORDERS: dict[str, dict[str, Any]] = {}
 WHOP_ORDERS: dict[str, dict[str, Any]] = {}
 WHOP_RECOVER_TS: dict[str, float] = {}
+PDF_GENERATING: dict[str, float] = {}
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 REPORT_DATA_DIR = DATA_DIR / "reports"
@@ -1255,12 +1256,28 @@ def _save_pdf_disk(vin: str, plan_id: str, pdf: bytes) -> None:
 
 
 async def _pregen_report(vin: str, plan: str) -> None:
-    """Pre-generate (and cache) a report PDF in the background after payment."""
+    """Pre-generate (and cache) a report PDF in the background after payment.
+    Dedupes by vin:plan so concurrent triggers never double-bill the data fee."""
+    key = f"{vin}:{plan}"
+    if key in PDF_GENERATING:
+        return
+    PDF_GENERATING[key] = time.time()
     try:
         await render_pdf(vin, plan)
         logger.info("Pre-generated report PDF for %s (%s)", vin, plan)
     except Exception as exc:
         logger.warning("Background PDF pre-generation failed for %s: %s", vin, exc)
+    finally:
+        PDF_GENERATING.pop(key, None)
+
+
+def pdf_is_ready(vin: str, plan: str) -> bool:
+    if PDF_CACHE.get(f"{vin}:{plan}") is not None:
+        return True
+    try:
+        return (PDF_DIR / f"{vin}_{plan}.pdf").is_file()
+    except OSError:
+        return False
 
 
 def protect_pdf(pdf: bytes) -> bytes:
@@ -1786,6 +1803,9 @@ async def whop_report(request: Request, order_id: str) -> Response:
         payment = await whop_fetch_payment(order.get("payment_id") or "")
         if not whop_payment_matches(payment, order_id):
             raise HTTPException(status_code=403, detail="Payment is not confirmed at Whop yet.")
+    if not pdf_is_ready(order["vin"], order["plan"]):
+        asyncio.create_task(_pregen_report(order["vin"], order["plan"]))
+        return JSONResponse({"status": "generating"}, status_code=202)
     pdf = await render_pdf(order["vin"], order["plan"])
     return Response(
         content=pdf,
