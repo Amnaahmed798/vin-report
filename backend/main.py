@@ -1175,6 +1175,15 @@ async def render_pdf(vin: str, plan_id: str = "gold") -> bytes:
     return pdf
 
 
+async def _pregen_report(vin: str, plan: str) -> None:
+    """Pre-generate (and cache) a report PDF in the background after payment."""
+    try:
+        await render_pdf(vin, plan)
+        logger.info("Pre-generated report PDF for %s (%s)", vin, plan)
+    except Exception as exc:
+        logger.warning("Background PDF pre-generation failed for %s: %s", vin, exc)
+
+
 def protect_pdf(pdf: bytes) -> bytes:
     """Encrypt the PDF with an empty user password and owner password.
 
@@ -1598,6 +1607,7 @@ async def whop_webhook(request: Request) -> Response:
             order["payment_id"] = data.get("id")
             order["paid_at"] = time.time()
             _save_whop_orders()
+            asyncio.create_task(_pregen_report(order["vin"], order["plan"]))
         else:
             raise HTTPException(status_code=500, detail="Payment could not be verified at Whop.")
     return Response(status_code=200)
