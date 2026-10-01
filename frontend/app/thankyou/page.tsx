@@ -156,6 +156,12 @@ function ThankYouBody() {
                 )}
               </button>
 
+              {downloading && (
+                <p className="mt-3 text-xs leading-relaxed text-slate-500">
+                  The first download generates your report, which can take up to 2 minutes. Please keep this tab open.
+                </p>
+              )}
+
               {downloadError && (
                 <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5">
                   <p className="text-xs font-semibold text-red-700">{downloadError}</p>

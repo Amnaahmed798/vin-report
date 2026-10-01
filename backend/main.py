@@ -43,6 +43,7 @@ LOOKUP_CACHE = TTLCache(ttl_seconds=86400, max_items=20000)
 PDF_CACHE = TTLCache(ttl_seconds=3600, max_items=2000)
 PENDING_ORDERS: dict[str, dict[str, Any]] = {}
 WHOP_ORDERS: dict[str, dict[str, Any]] = {}
+WHOP_RECOVER_TS: dict[str, float] = {}
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 REPORT_DATA_DIR = DATA_DIR / "reports"
@@ -76,6 +77,24 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.on_event("startup")
+async def _startup_warm_paid_reports() -> None:
+    """Re-generate PDFs for paid orders after a restart so downloads are instant."""
+
+    async def _warm() -> None:
+        paid = [o for o in WHOP_ORDERS.values() if o.get("status") == "paid"]
+        for order in paid:
+            try:
+                await render_pdf(order.get("vin", ""), order.get("plan", "basic"))
+            except Exception as exc:
+                logger.warning("Startup warm failed for %s: %s", order.get("vin"), exc)
+
+    try:
+        asyncio.create_task(_warm())
+    except Exception as exc:
+        logger.warning("Could not schedule startup report warm-up: %s", exc)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1473,7 +1492,11 @@ _load_whop_orders()
 
 def prune_whop_orders() -> None:
     now = time.time()
-    stale = [k for k, o in WHOP_ORDERS.items() if now - o.get("created_at", 0) > 6 * 3600]
+    stale = [
+        k
+        for k, o in WHOP_ORDERS.items()
+        if o.get("status") != "paid" and now - o.get("created_at", 0) > 6 * 3600
+    ]
     for k in stale:
         WHOP_ORDERS.pop(k, None)
     if stale:
@@ -1545,6 +1568,61 @@ async def whop_fetch_payment(payment_id: str) -> dict | None:
     except Exception as exc:
         logger.warning("Whop payment verification error for %s: %s", payment_id, exc)
         return None
+
+
+async def _whop_list_payments(limit: int = 100) -> list[dict]:
+    """List our company's recent Whop payments (newest first)."""
+    key = WHOP_VERIFY_API_KEY or WHOP_API_KEY
+    if not key or not WHOP_BUSINESS_ID:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                "https://api.whop.com/api/v1/payments",
+                params={
+                    "account_id": WHOP_BUSINESS_ID,
+                    "limit": limit,
+                    "sort": "-created_at",
+                },
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            return items if isinstance(items, list) else []
+    except Exception as exc:
+        logger.warning("Whop payments list error: %s", exc)
+        return []
+
+
+async def whop_recover_order(order_id: str) -> bool:
+    """If a Whop payment exists for this order but the webhook never confirmed it,
+    look it up from Whop and recreate the order as paid. Throttled (30s) to avoid
+    hammering Whop while the thank-you page polls."""
+    now = time.time()
+    if now - WHOP_RECOVER_TS.get(order_id, 0) < 30:
+        return False
+    WHOP_RECOVER_TS[order_id] = now
+    payments = await _whop_list_payments()
+    for payment in payments:
+        if not whop_payment_matches(payment, order_id):
+            continue
+        meta = payment.get("metadata") or {}
+        WHOP_ORDERS[order_id] = {
+            "vin": meta.get("vin", ""),
+            "plan": str(meta.get("plan") or "basic").lower(),
+            "provider": "whop",
+            "status": "paid",
+            "payment_id": payment.get("id"),
+            "created_at": time.time(),
+            "paid_at": time.time(),
+        }
+        _save_whop_orders()
+        logger.info("Recovered paid Whop order %s from payment %s", order_id, payment.get("id"))
+        asyncio.create_task(_pregen_report(WHOP_ORDERS[order_id]["vin"], WHOP_ORDERS[order_id]["plan"]))
+        return True
+    return False
 
 
 def whop_payment_matches(payment: dict | None, order_id: str) -> bool:
@@ -1677,6 +1755,9 @@ async def whop_webhook(request: Request) -> Response:
 async def whop_order_status(request: Request, order_id: str) -> dict[str, Any]:
     order = WHOP_ORDERS.get(order_id)
     if not order:
+        await whop_recover_order(order_id)
+        order = WHOP_ORDERS.get(order_id)
+    if not order:
         raise HTTPException(status_code=404, detail="Order not found.")
     return {
         "order_id": order_id,
@@ -1692,7 +1773,13 @@ async def whop_report(request: Request, order_id: str) -> Response:
     """Serve the report PDF once the Whop payment has been confirmed by webhook."""
     order = WHOP_ORDERS.get(order_id)
     if not order:
+        await whop_recover_order(order_id)
+        order = WHOP_ORDERS.get(order_id)
+    if not order:
         raise HTTPException(status_code=404, detail="Order not found.")
+    if order["status"] != "paid":
+        await whop_recover_order(order_id)
+        order = WHOP_ORDERS.get(order_id)
     if order["status"] != "paid":
         raise HTTPException(status_code=403, detail="Payment not confirmed yet.")
     if not WHOP_WEBHOOK_SECRET and WHOP_API_KEY:
