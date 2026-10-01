@@ -147,6 +147,9 @@ PLAN_PRICES = {"basic": 45.00, "gold": 65.00, "premium": 85.00}
 PLAN_REPORTS = {"basic": 1, "gold": 2, "premium": 3}
 
 WHOP_API_KEY = os.getenv("WHOP_API_KEY", "")
+# Company API key with payment read permission, used ONLY to verify payments.
+# Falls back to WHOP_API_KEY when unset.
+WHOP_VERIFY_API_KEY = os.getenv("WHOP_VERIFY_API_KEY", "")
 WHOP_WEBHOOK_SECRET = os.getenv("WHOP_WEBHOOK_SECRET", "")
 WHOP_BUSINESS_ID = os.getenv("WHOP_BUSINESS_ID", "")
 WHOP_PLAN_IDS = {
@@ -1458,13 +1461,14 @@ PAYMENT_OK_STATUSES = {"succeeded", "captured", "paid", "completed", "settled", 
 
 async def whop_fetch_payment(payment_id: str) -> dict | None:
     """Fetch a Whop payment by id. Returns the payment object, or None if it can't be confirmed."""
-    if not WHOP_API_KEY or not payment_id:
+    key = WHOP_VERIFY_API_KEY or WHOP_API_KEY
+    if not key or not payment_id:
         return None
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             resp = await client.get(
                 f"https://api.whop.com/api/v1/payments/{payment_id}",
-                headers={"Authorization": f"Bearer {WHOP_API_KEY}", "Accept": "application/json"},
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
             )
             if resp.status_code != 200:
                 return None
