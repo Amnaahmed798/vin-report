@@ -273,16 +273,16 @@ export function getQuickBooksAuthUrl(): string {
   return `${API_BASE}/api/quickbooks/auth`;
 }
 
-export type WhopCheckoutResult = {
-  checkout_url: string;
+export type PaypalCheckoutResult = {
+  approve_url: string;
   order_id: string;
   provider: string;
   plan: string;
   price_usd: number;
 };
 
-export async function whopCheckout(vin: string, plan: string): Promise<WhopCheckoutResult> {
-  const res = await fetch(`${API_BASE}/api/whop/checkout`, {
+export async function paypalCheckout(vin: string, plan: string): Promise<PaypalCheckoutResult> {
+  const res = await fetch(`${API_BASE}/api/paypal/checkout`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ vin, plan }),
@@ -293,26 +293,39 @@ export async function whopCheckout(vin: string, plan: string): Promise<WhopCheck
   return res.json();
 }
 
-export type WhopOrderStatus = {
+export type PaypalOrderStatus = {
   order_id: string;
+  paypal_order_id?: string;
   vin: string;
   plan: string;
   status: "pending" | "paid";
   price_usd: number;
 };
 
-export async function whopOrderStatus(orderId: string): Promise<WhopOrderStatus> {
-  const res = await fetch(`${API_BASE}/api/whop/order/${encodeURIComponent(orderId)}`);
+export async function paypalCapture(orderId: string): Promise<PaypalOrderStatus> {
+  const res = await fetch(`${API_BASE}/api/paypal/capture`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ order_id: orderId }),
+  });
   if (!res.ok) {
     throw new Error(await readDetail(res));
   }
   return res.json();
 }
 
-export async function whopDownload(orderId: string): Promise<Blob> {
+export async function paypalOrderStatus(orderId: string): Promise<PaypalOrderStatus> {
+  const res = await fetch(`${API_BASE}/api/paypal/order/${encodeURIComponent(orderId)}`);
+  if (!res.ok) {
+    throw new Error(await readDetail(res));
+  }
+  return res.json();
+}
+
+export async function paypalDownload(orderId: string): Promise<Blob> {
   const deadline = Date.now() + 180000;
   while (Date.now() < deadline) {
-    const res = await fetch(`${API_BASE}/api/whop/report/${encodeURIComponent(orderId)}`);
+    const res = await fetch(`${API_BASE}/api/paypal/report/${encodeURIComponent(orderId)}`);
     if (res.ok) {
       return res.blob();
     }

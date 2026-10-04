@@ -3,7 +3,7 @@
 import { use, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import Navbar from "@/components/Navbar";
-import { fetchVinDecode, whopCheckout, type VinDecode } from "@/lib/api";
+import { fetchVinDecode, paypalCheckout, type VinDecode } from "@/lib/api";
 
 type Plan = {
   id: string;
@@ -141,9 +141,9 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
   function handleBuyNow(plan: Plan) {
     if (checkoutPlanId) return;
     setCheckoutPlanId(plan.id);
-    whopCheckout(vin, plan.id)
+    paypalCheckout(vin, plan.id)
       .then((res) => {
-        window.location.href = res.checkout_url;
+        window.location.href = res.approve_url;
       })
       .catch((err) => {
         setError(err instanceof Error ? err.message : "Could not start checkout. Please try again.");
@@ -405,7 +405,7 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
             {/* Checkout note */}
             <div className="mt-6">
               <p className="text-center text-xs text-slate-400">
-                Secure checkout powered by Whop — pay on Whop&apos;s hosted page, then download your report
+                Secure checkout powered by PayPal — pay on PayPal&apos;s hosted page, then download your report
               </p>
             </div>
 
@@ -415,7 +415,7 @@ export default function PlansPage({ params }: { params: Promise<{ vin: string }>
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4 text-emerald-500">
                   <path fillRule="evenodd" d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zm3 8V5.5a3 3 0 10-6 0V9h6z" clipRule="evenodd" />
                 </svg>
-                Secure payment via Whop
+                Secure payment via PayPal
               </span>
               <span>No account required</span>
               <span>Instant PDF download</span>

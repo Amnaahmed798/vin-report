@@ -86,6 +86,7 @@ async def _startup_warm_paid_reports() -> None:
 
     async def _warm() -> None:
         paid = [o for o in WHOP_ORDERS.values() if o.get("status") == "paid"]
+        paid += [o for o in PAYPAL_ORDERS.values() if o.get("status") == "paid"]
         for order in paid:
             try:
                 await render_pdf(order.get("vin", ""), order.get("plan", "basic"))
@@ -182,6 +183,13 @@ WHOP_PLAN_IDS = {
     "premium": os.getenv("WHOP_PLAN_PREMIUM", ""),
 }
 WHOP_RETURN_BASE = os.getenv("WHOP_RETURN_BASE", "https://carinspectionpro.com")
+
+PAYPAL_MODE = os.getenv("PAYPAL_MODE", "sandbox").lower()
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "")
+PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID", "")
+PAYPAL_RETURN_BASE = os.getenv("PAYPAL_RETURN_BASE", "https://carinspectionpro.com")
+PAYPAL_API = "https://api-m.sandbox.paypal.com" if PAYPAL_MODE == "sandbox" else "https://api-m.paypal.com"
 
 GLOBALVIN_API_KEY = os.getenv("GLOBALVIN_API_KEY", "")
 GLOBALVIN_BASE_URL = os.getenv("GLOBALVIN_BASE_URL", "https://globalvin.co/backend")
@@ -1897,3 +1905,402 @@ code {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding
 <p>Realm / company ID: <code>{QB_REALM_ID}</code><br>Environment: <code>{QB_ENV}</code></p>
 <p>You can close this window. On-site card checkout is now enabled.</p>
 </div></body></html>""")
+
+
+# ============================================================
+# PayPal checkout + webhooks
+# ============================================================
+PAYPAL_ORDERS_FILE = Path(__file__).resolve().parent / "data" / "paypal_orders.json"
+PAYPAL_ORDERS: dict[str, dict[str, Any]] = {}
+PAYPAL_RECOVER_TS: dict[str, float] = {}
+PAYPAL_TOKEN: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
+
+
+def _load_paypal_orders() -> None:
+    try:
+        with open(PAYPAL_ORDERS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            PAYPAL_ORDERS.update({k: v for k, v in data.items() if isinstance(v, dict)})
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("Could not load %s: %s", PAYPAL_ORDERS_FILE, exc)
+
+
+def _save_paypal_orders() -> None:
+    try:
+        PAYPAL_ORDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PAYPAL_ORDERS_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(PAYPAL_ORDERS, fh)
+        tmp.replace(PAYPAL_ORDERS_FILE)
+    except Exception as exc:
+        logger.warning("Could not save %s: %s", PAYPAL_ORDERS_FILE, exc)
+
+
+_load_paypal_orders()
+
+
+def prune_paypal_orders() -> None:
+    now = time.time()
+    stale = [
+        k
+        for k, o in PAYPAL_ORDERS.items()
+        if o.get("status") not in ("paid", "completed") and now - o.get("created_at", 0) > 6 * 3600
+    ]
+    for k in stale:
+        PAYPAL_ORDERS.pop(k, None)
+    if stale:
+        _save_paypal_orders()
+
+
+async def _paypal_access_token() -> str:
+    """Return a cached PayPal OAuth2 access token (client credentials)."""
+    if PAYPAL_TOKEN["access_token"] and time.time() < PAYPAL_TOKEN["expires_at"] - 60:
+        return PAYPAL_TOKEN["access_token"]
+    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+        return ""
+    auth = base64.b64encode(f"{PAYPAL_CLIENT_ID}:{PAYPAL_CLIENT_SECRET}".encode()).decode()
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.post(
+                f"{PAYPAL_API}/v1/oauth2/token",
+                data={"grant_type": "client_credentials"},
+                headers={
+                    "Authorization": f"Basic {auth}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning("PayPal token error %s: %s", resp.status_code, resp.text)
+                return ""
+            data = resp.json()
+            PAYPAL_TOKEN["access_token"] = data.get("access_token", "")
+            PAYPAL_TOKEN["expires_at"] = time.time() + float(data.get("expires_in", 3600))
+            return PAYPAL_TOKEN["access_token"]
+    except Exception as exc:
+        logger.warning("PayPal token request error: %s", exc)
+        return ""
+
+
+async def _paypal_create_order(order_id: str, amount: float, return_url: str, cancel_url: str) -> tuple[str, str]:
+    """Create a PayPal order with intent CAPTURE. Returns (approve_url, paypal_order_id)."""
+    token = await _paypal_access_token()
+    if not token:
+        return "", ""
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.post(
+                f"{PAYPAL_API}/v2/checkout/orders",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={
+                    "intent": "CAPTURE",
+                    "purchase_units": [
+                        {
+                            "reference_id": order_id,
+                            "custom_id": order_id,
+                            "description": "Vehicle history report (VIN Report)",
+                            "amount": {"currency_code": "USD", "value": f"{amount:.2f}"},
+                        }
+                    ],
+                    "application_context": {
+                        "brand_name": "VIN Report",
+                        "shipping_preference": "NO_SHIPPING",
+                        "user_action": "PAY_NOW",
+                        "return_url": return_url,
+                        "cancel_url": cancel_url,
+                    },
+                },
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning("PayPal create order failed %s: %s", resp.status_code, resp.text)
+                return "", ""
+            data = resp.json()
+            approve_url = ""
+            for link in data.get("links", []):
+                if link.get("rel") == "approve":
+                    approve_url = link.get("href", "")
+                    break
+            return approve_url, data.get("id", "")
+    except Exception as exc:
+        logger.warning("PayPal create order error: %s", exc)
+        return "", ""
+
+
+async def _paypal_capture(paypal_order_id: str) -> dict | None:
+    token = await _paypal_access_token()
+    if not token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.post(
+                f"{PAYPAL_API}/v2/checkout/orders/{quote(paypal_order_id)}/capture",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={},
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning("PayPal capture failed %s: %s", resp.status_code, resp.text)
+                return None
+            return resp.json()
+    except Exception as exc:
+        logger.warning("PayPal capture error: %s", exc)
+        return None
+
+
+async def _paypal_order_details(paypal_order_id: str) -> dict | None:
+    token = await _paypal_access_token()
+    if not token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(
+                f"{PAYPAL_API}/v2/checkout/orders/{quote(paypal_order_id)}",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+    except Exception as exc:
+        logger.warning("PayPal order details error: %s", exc)
+        return None
+
+
+async def _paypal_verify_webhook(headers: dict, body: bytes) -> bool:
+    """Ask PayPal to verify a webhook signature (authoritative)."""
+    if not PAYPAL_WEBHOOK_ID:
+        return False
+    token = await _paypal_access_token()
+    if not token:
+        return False
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return False
+    verify_body = {
+        "auth_algo": headers.get("paypal-auth-algo", ""),
+        "cert_url": headers.get("paypal-cert-url", ""),
+        "transmission_id": headers.get("paypal-transmission-id", ""),
+        "transmission_sig": headers.get("paypal-transmission-sig", ""),
+        "transmission_time": headers.get("paypal-transmission-time", ""),
+        "webhook_id": PAYPAL_WEBHOOK_ID,
+        "webhook_event": payload,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.post(
+                f"{PAYPAL_API}/v1/notifications/verify-webhook-signature",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=verify_body,
+            )
+            if resp.status_code != 200:
+                return False
+            return resp.json().get("verification_status") == "SUCCESS"
+    except Exception as exc:
+        logger.warning("PayPal webhook verify error: %s", exc)
+        return False
+
+
+def _paypal_amount_matches(order: dict, amount_value: object | None) -> bool:
+    expected = PLAN_PRICES.get(order.get("plan", ""), PDF_PRICE_USD)
+    try:
+        return abs(float(amount_value) - expected) < 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def _paypal_finalize(order_id: str, paypal_order_id: str, capture_id: str | None, amount_ok: bool) -> bool:
+    order = PAYPAL_ORDERS.get(order_id)
+    if not order:
+        return False
+    if order.get("status") == "paid":
+        return True
+    if not amount_ok:
+        logger.warning("PayPal amount mismatch for order %s — refusing to mark paid", order_id)
+        return False
+    order["status"] = "paid"
+    order["payment_id"] = capture_id
+    order["paypal_order_id"] = paypal_order_id
+    order["paid_at"] = time.time()
+    _save_paypal_orders()
+    asyncio.create_task(_pregen_report(order.get("vin", ""), order.get("plan", "basic")))
+    return True
+
+
+async def _paypal_recover_order(order_id: str, order: dict) -> None:
+    """If a pending PayPal order is already COMPLETED, mark it paid without the webhook."""
+    now = time.time()
+    if now - PAYPAL_RECOVER_TS.get(order_id, 0) < 30:
+        return
+    PAYPAL_RECOVER_TS[order_id] = now
+    paypal_order_id = order.get("paypal_order_id", "")
+    if not paypal_order_id:
+        return
+    details = await _paypal_order_details(paypal_order_id)
+    if not details or details.get("status") != "COMPLETED":
+        return
+    purchase = (details.get("purchase_units") or [{}])[0]
+    if purchase.get("custom_id") and purchase["custom_id"] != order_id:
+        return
+    captures = ((purchase.get("payments") or {}).get("captures") or [{}])
+    cap = captures[0] if captures else {}
+    amount = (cap.get("amount") or {}).get("value")
+    if not _paypal_amount_matches(order, amount):
+        return
+    _paypal_finalize(order_id, paypal_order_id, cap.get("id"), True)
+
+
+def _paypal_order_summary(order_id: str, order: dict) -> dict[str, Any]:
+    return {
+        "order_id": order_id,
+        "paypal_order_id": order.get("paypal_order_id"),
+        "vin": order["vin"],
+        "plan": order["plan"],
+        "status": order["status"],
+        "price_usd": PLAN_PRICES.get(order["plan"], PDF_PRICE_USD),
+    }
+
+
+@app.post("/api/paypal/checkout")
+@limiter.limit("15/minute")
+async def paypal_checkout(request: Request) -> dict[str, Any]:
+    """Create a pending order and return the PayPal approval URL carrying our metadata."""
+    body = await request.json()
+    vin = validate_vin(str(body.get("vin") or ""))
+    plan = str(body.get("plan") or "").lower()
+    if plan not in PLAN_PRICES:
+        raise HTTPException(status_code=400, detail="Invalid plan. Must be basic, gold, or premium.")
+    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="PayPal is not configured on the server.")
+    prune_paypal_orders()
+    price_usd = PLAN_PRICES[plan]
+    order_id = "pp_" + secrets.token_urlsafe(10)
+    return_url = (
+        f"{PAYPAL_RETURN_BASE}/thankyou"
+        f"?order={order_id}&vin={quote(vin)}&plan={plan}&name={plan.capitalize()}&price={price_usd:.0f}"
+    )
+    cancel_url = f"{PAYPAL_RETURN_BASE}/thankyou?order={order_id}"
+    approve_url, paypal_order_id = await _paypal_create_order(order_id, price_usd, return_url, cancel_url)
+    if not approve_url or not paypal_order_id:
+        raise HTTPException(status_code=502, detail="Could not start PayPal checkout. Please try again.")
+    PAYPAL_ORDERS[order_id] = {
+        "vin": vin,
+        "plan": plan,
+        "provider": "paypal",
+        "status": "pending",
+        "payment_id": None,
+        "paypal_order_id": paypal_order_id,
+        "created_at": time.time(),
+    }
+    _save_paypal_orders()
+    return {
+        "approve_url": approve_url,
+        "order_id": order_id,
+        "provider": "paypal",
+        "plan": plan,
+        "price_usd": price_usd,
+    }
+
+
+@app.post("/api/paypal/capture")
+@limiter.limit("20/minute")
+async def paypal_capture(request: Request) -> dict[str, Any]:
+    """Capture an approved PayPal order (called from the thank-you page) and unlock the report."""
+    body = await request.json()
+    order_id = str(body.get("order_id") or "")
+    order = PAYPAL_ORDERS.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    if order.get("status") == "paid":
+        return _paypal_order_summary(order_id, order)
+    paypal_order_id = order.get("paypal_order_id", "")
+    if not paypal_order_id:
+        raise HTTPException(status_code=400, detail="PayPal order is not associated yet.")
+    capture = await _paypal_capture(paypal_order_id)
+    if not capture:
+        raise HTTPException(status_code=502, detail="Could not capture your payment at PayPal. Please retry.")
+    purchase = (capture.get("purchase_units") or [{}])[0]
+    if purchase.get("custom_id") and purchase["custom_id"] != order_id:
+        logger.warning("PayPal capture custom_id mismatch for order %s", order_id)
+        raise HTTPException(status_code=403, detail="Order mismatch.")
+    captures = ((purchase.get("payments") or {}).get("captures") or [{}])
+    cap = captures[0] if captures else {}
+    cap_status = str(cap.get("status") or "")
+    amount = (cap.get("amount") or {}).get("value")
+    if capture.get("status") == "COMPLETED" and cap_status == "COMPLETED":
+        if not _paypal_finalize(order_id, paypal_order_id, cap.get("id"), _paypal_amount_matches(order, amount)):
+            raise HTTPException(status_code=502, detail="Payment amount does not match the selected plan.")
+    else:
+        logger.warning("PayPal capture not completed for %s: status=%s cap=%s", order_id, capture.get("status"), cap_status)
+        order["status"] = "pending"
+        _save_paypal_orders()
+    return _paypal_order_summary(order_id, order)
+
+
+@app.get("/api/paypal/order/{order_id}")
+async def paypal_order_status(request: Request, order_id: str) -> dict[str, Any]:
+    order = PAYPAL_ORDERS.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    if order.get("status") != "paid" and order.get("paypal_order_id"):
+        await _paypal_recover_order(order_id, order)
+    return _paypal_order_summary(order_id, order)
+
+
+@app.get("/api/paypal/report/{order_id}")
+async def paypal_report(request: Request, order_id: str) -> Response:
+    """Serve the report PDF once the PayPal capture has been confirmed."""
+    order = PAYPAL_ORDERS.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    if order.get("status") != "paid":
+        await _paypal_recover_order(order_id, order)
+    if order.get("status") != "paid":
+        raise HTTPException(status_code=403, detail="Payment not confirmed yet.")
+    if not pdf_is_ready(order.get("vin", ""), order.get("plan", "basic")):
+        asyncio.create_task(_pregen_report(order.get("vin", ""), order.get("plan", "basic")))
+        return JSONResponse({"status": "generating"}, status_code=202)
+    pdf = await render_pdf(order.get("vin", ""), order.get("plan", "basic"))
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{order["vin"]}.pdf"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/paypal/webhook")
+async def paypal_webhook(request: Request) -> Response:
+    """Receive PayPal events (PAYMENT.CAPTURE.COMPLETED etc.) and mark orders as paid."""
+    body_bytes = await request.body()
+    if not PAYPAL_WEBHOOK_ID:
+        logger.info("PayPal webhook id not set — skipping (capture endpoint is the source of truth).")
+        return Response(status_code=200)
+    headers = {k.lower().replace("-", "_"): v for k, v in request.headers.items()}
+    if not await _paypal_verify_webhook(headers, body_bytes):
+        logger.warning("PayPal webhook rejected: verification failed")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature.")
+    try:
+        event = json.loads(body_bytes.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+    event_type = event.get("event_type", "")
+    resource = event.get("resource") or {}
+    order_id = resource.get("custom_id", "")
+    if event_type == "PAYMENT.CAPTURE.COMPLETED":
+        order = PAYPAL_ORDERS.get(order_id) if order_id else None
+        if not order:
+            logger.warning("PayPal capture completed for unknown order_id=%s", order_id)
+            return Response(status_code=200)
+        if order.get("status") != "paid":
+            amount_ok = _paypal_amount_matches(order, (resource.get("amount") or {}).get("value"))
+            related = (resource.get("supplementary_data") or {}).get("related_ids") or {}
+            _paypal_finalize(order_id, related.get("order_id") or order.get("paypal_order_id", ""), resource.get("id"), amount_ok)
+    elif event_type in ("PAYMENT.CAPTURE.DENIED", "PAYMENT.CAPTURE.PENDING", "CHECKOUT.PAYMENT-APPROVAL.REVERSED"):
+        order = PAYPAL_ORDERS.get(order_id) if order_id else None
+        if order:
+            order["status"] = "pending"
+            _save_paypal_orders()
+    return Response(status_code=200)

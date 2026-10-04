@@ -4,7 +4,7 @@ import { Suspense, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import Navbar from "@/components/Navbar";
-import { downloadBlob, whopDownload, whopOrderStatus } from "@/lib/api";
+import { downloadBlob, paypalCapture, paypalDownload, paypalOrderStatus } from "@/lib/api";
 
 const POLL_INTERVAL_MS = 2500;
 const POLL_TIMEOUT_MS = 120000;
@@ -35,7 +35,7 @@ function ThankYouBody() {
     const poll = async () => {
       if (cancelled) return;
       try {
-        const status = await whopOrderStatus(orderId);
+        const status = await paypalOrderStatus(orderId);
         if (cancelled) return;
         if (status.status === "paid") {
           setPayable(true);
@@ -50,14 +50,30 @@ function ThankYouBody() {
       if (Date.now() - (startedAtRef.current ?? 0) > POLL_TIMEOUT_MS) {
         setConfirming(false);
         setOrderError(
-          "We're still waiting for Whop to confirm your payment. It usually takes a few seconds — check back shortly.",
+          "We're still waiting for PayPal to confirm your payment. It usually takes a few seconds — check back shortly.",
         );
         return;
       }
       timer = setTimeout(poll, POLL_INTERVAL_MS);
     };
 
-    poll();
+    const tryCapture = async () => {
+      if (cancelled) return;
+      try {
+        const status = await paypalCapture(orderId);
+        if (cancelled) return;
+        if (status.status === "paid") {
+          setPayable(true);
+          setConfirming(false);
+          return;
+        }
+      } catch {
+        // Buyer may not have approved yet — fall through to polling.
+      }
+      poll();
+    };
+
+    tryCapture();
 
     return () => {
       cancelled = true;
@@ -70,7 +86,7 @@ function ThankYouBody() {
     setDownloading(true);
     setDownloadError(null);
     try {
-      const blob = await whopDownload(orderId);
+      const blob = await paypalDownload(orderId);
       const filename = vin ? `${vin}.pdf` : "vehicle-report.pdf";
       downloadBlob(blob, filename);
       setDownloadDone(true);
@@ -116,7 +132,7 @@ function ThankYouBody() {
               <div className="mt-6 flex flex-col items-center gap-3">
                 <span className="h-8 w-8 animate-spin rounded-full border-4 border-blue-200 border-t-blue-600" />
                 <p className="text-sm leading-relaxed text-slate-500">
-                  Confirming your payment with Whop…
+                  Confirming your payment with PayPal…
                 </p>
               </div>
             </>
