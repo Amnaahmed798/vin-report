@@ -16,11 +16,15 @@ type Plan = {
   locked: string[];
 };
 
+const PLAN_PRICE_BASIC = Number(process.env.NEXT_PUBLIC_PLAN_PRICE_BASIC ?? 3);
+const PLAN_PRICE_GOLD = Number(process.env.NEXT_PUBLIC_PLAN_PRICE_GOLD ?? 65);
+const PLAN_PRICE_PREMIUM = Number(process.env.NEXT_PUBLIC_PLAN_PRICE_PREMIUM ?? 85);
+
 const PLANS: Plan[] = [
   {
     id: "basic",
     name: "Basic",
-    price: 45,
+    price: PLAN_PRICE_BASIC,
     reports: 1,
     color: "blue",
     features: [
@@ -41,7 +45,7 @@ const PLANS: Plan[] = [
   {
     id: "gold",
     name: "Gold",
-    price: 65,
+    price: PLAN_PRICE_GOLD,
     reports: 2,
     badge: "Most Popular",
     color: "blue",
@@ -63,7 +67,7 @@ const PLANS: Plan[] = [
   {
     id: "premium",
     name: "Premium",
-    price: 85,
+    price: PLAN_PRICE_PREMIUM,
     reports: 3,
     badge: "Best Value",
     color: "blue",
