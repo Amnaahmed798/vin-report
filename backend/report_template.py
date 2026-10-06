@@ -403,7 +403,7 @@ ICON_GOOD = '<img src="assets/icons/reading.png" alt=""/>'
 ICON_GUARANTEED = '<img src="assets/icons/protected.png" alt=""/>'
 TICK = '<img class="tick" src="assets/icons/tickicon.png" alt=""/>'
 
-PRICE_USD = "55.00"
+PRICE_USD = "45.00"
 
 SAMPLE_HIGHLIGHTS = {
     "accident": True,

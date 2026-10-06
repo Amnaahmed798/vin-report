@@ -165,7 +165,7 @@ QB_REDIRECT_URI = os.getenv("QB_REDIRECT_URI", "http://localhost:8000/api/quickb
 QB_AUTH_STATE: str = ""
 PDF_PRICE_USD = float(os.getenv("PDF_PRICE_USD", "55.00"))
 PLAN_PRICES = {
-    "basic": float(os.getenv("PLAN_PRICE_BASIC", "3.00")),
+    "basic": float(os.getenv("PLAN_PRICE_BASIC", "45.00")),
     "gold": float(os.getenv("PLAN_PRICE_GOLD", "65.00")),
     "premium": float(os.getenv("PLAN_PRICE_PREMIUM", "85.00")),
 }

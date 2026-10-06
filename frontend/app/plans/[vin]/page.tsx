@@ -16,7 +16,7 @@ type Plan = {
   locked: string[];
 };
 
-const PLAN_PRICE_BASIC = Number(process.env.NEXT_PUBLIC_PLAN_PRICE_BASIC ?? 3);
+const PLAN_PRICE_BASIC = Number(process.env.NEXT_PUBLIC_PLAN_PRICE_BASIC ?? 45);
 const PLAN_PRICE_GOLD = Number(process.env.NEXT_PUBLIC_PLAN_PRICE_GOLD ?? 65);
 const PLAN_PRICE_PREMIUM = Number(process.env.NEXT_PUBLIC_PLAN_PRICE_PREMIUM ?? 85);
 
